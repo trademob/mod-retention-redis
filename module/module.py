@@ -25,6 +25,16 @@
 # This Class is an example of an Scheduler module
 # Here for the configuration phase AND running one
 
+'''
+    The `retention-redis` is used to keep track of shinken retention data between restarts.
+    Therefore it saves this data to redis.
+
+    The data in redis looks like:
+
+    HOST-<hostname> (type: String) :                            (cPickle data of the host)
+    SERVICE-<hostname>-<service-description> (type: String) :   (cPickle data of the service)
+'''
+
 try:
     import redis
 except ImportError:
@@ -37,100 +47,93 @@ from shinken.log import logger
 properties = {
     'daemons': ['scheduler'],
     'type': 'redis_retention',
-    'external': False,
-    }
+    'external': False
+}
 
 
 def get_instance(plugin):
-    """
+    '''
     Called by the plugin manager to get a broker
-    """
+    '''
     logger.debug("Get a redis retention scheduler module for plugin %s" % plugin.get_name())
     if not redis:
         logger.error('Missing the module python-redis. Please install it.')
         raise Exception
     server = plugin.server
-    instance = Redis_retention_scheduler(plugin, server)
+    instance = RedisRetentionScheduler(plugin, server)
     return instance
 
 
-class Redis_retention_scheduler(BaseModule):
+class RedisRetentionScheduler(BaseModule):
+    '''
+        The RedisRetentionScheduler saves retention data to redis. It listens on
+        `save_retention` and `load_retention` events using the hook_* functions.
+    '''
     def __init__(self, modconf, server):
         BaseModule.__init__(self, modconf)
         self.server = server
+        self.client = None # will be initialized later when scheduler calls `init`
 
     def init(self):
-        """
+        '''
         Called by Scheduler to say 'let's prepare yourself guy'
-        """
-        logger.debug("[RedisRetention] Initialization of the redis module")
-        #self.return_queue = self.properties['from_queue']
-        self.mc = redis.Redis(self.server)
+        '''
+        logger.debug('[RedisRetention] Initialization of the redis module')
+        self.client = redis.Redis(self.server)
 
     def hook_save_retention(self, daemon):
-        """
-        main function that is called in the retention creation pass
-        """
-        logger.debug("[RedisRetention] asking me to update the retention objects")
+        '''
+        Hook point for saving retention data.
+        '''
+        logger.debug('[RedisRetention] asking me to update the retention objects')
 
+        # get all retention data from the daemon and persist it
         all_data = daemon.get_retention_data()
 
-        hosts = all_data['hosts']
-        services = all_data['services']
+        for host_name, host in all_data['hosts'].iteritems():
+            key = "HOST-%s" % host_name
+            val = cPickle.dumps(host)
+            self.client.set(key, val)
 
-        # Now the flat file method
-        for h_name in hosts:
-            h = hosts[h_name]
-            key = "HOST-%s" % h_name
-            val = cPickle.dumps(h)
-            self.mc.set(key, val)
-
-        for (h_name, s_desc) in services:
-            s = services[(h_name, s_desc)]
-            key = "SERVICE-%s,%s" % (h_name, s_desc)
-            # space are not allowed in memcache key.. so change it by SPACE token
+        for (host_name, service_desc), service in all_data['services'].iteritems():
+            key = "SERVICE-%s,%s" % (host_name, service_desc)
+            # space are not allowed in redis key.. so change it by SPACE token
             key = key.replace(' ', 'SPACE')
-            #print "Using key", key
-            val = cPickle.dumps(s)
-            self.mc.set(key, val)
-        logger.info("Retention information updated in Redis")
+            val = cPickle.dumps(service)
+            self.client.set(key, val)
+        logger.info('Retention information updated in Redis')
 
-    # Should return if it succeed in the retention load or not
     def hook_load_retention(self, daemon):
-
-        # Now the new redis way :)
-        logger.debug("[RedisRetention] asking me to load the retention objects")
+        '''
+        Hook point for loading retention data. Final data should be passed to
+        `daemon.restore_retention_data`.
+        '''
+        logger.debug('[RedisRetention] asking me to load the retention objects')
 
         # We got list of loaded data from retention server
         ret_hosts = {}
         ret_services = {}
 
         # We must load the data and format as the scheduler want :)
-        for h in daemon.hosts:
-            key = "HOST-%s" % h.host_name
-            val = self.mc.get(key)
+        for host in daemon.hosts:
+            key = "HOST-%s" % host.host_name
+            val = self.client.get(key)
             if val is not None:
-                # redis get unicode, but we send string, so we are ok
-                #val = str(unicode(val))
                 val = cPickle.loads(val)
-                ret_hosts[h.host_name] = val
+                ret_hosts[host.host_name] = val
 
-        for s in daemon.services:
-            key = "SERVICE-%s,%s" % (s.host.host_name, s.service_description)
-            # space are not allowed in memcache key.. so change it by SPACE token
+        for service in daemon.services:
+            key = "SERVICE-%s,%s" % (service.host.host_name, service.service_description)
+            # space are not allowed in redis key.. so change it by SPACE token
             key = key.replace(' ', 'SPACE')
-            #print "Using key", key
-            val = self.mc.get(key)
+            val = self.client.get(key)
             if val is not None:
-                #val = str(unicode(val))
                 val = cPickle.loads(val)
-                ret_services[(s.host.host_name, s.service_description)] = val
+                ret_services[(service.host.host_name, service.service_description)] = val
 
         all_data = {'hosts': ret_hosts, 'services': ret_services}
 
         # Ok, now comme load them scheduler :)
         daemon.restore_retention_data(all_data)
 
-        logger.info("[RedisRetention] Retention objects loaded successfully.")
-
-        return True
+        logger.info('[RedisRetention] Retention objects loaded successfully.')
