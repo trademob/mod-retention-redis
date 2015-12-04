@@ -40,6 +40,7 @@ try:
 except ImportError:
     redis = None
 import cPickle
+import re
 
 from shinken.basemodule import BaseModule
 from shinken.log import logger
@@ -55,7 +56,7 @@ def get_instance(plugin):
     '''
     Called by the plugin manager to get a broker
     '''
-    logger.debug("Get a redis retention scheduler module for plugin %s" % plugin.get_name())
+    logger.debug('Get a redis retention scheduler module for plugin %s' % (plugin.get_name(), ))
     if not redis:
         logger.error('Missing the module python-redis. Please install it.')
         raise Exception
@@ -91,17 +92,51 @@ class RedisRetentionScheduler(BaseModule):
         all_data = daemon.get_retention_data()
 
         for host_name, host in all_data['hosts'].iteritems():
-            key = "HOST-%s" % host_name
+            key = 'HOST-%s' % (host_name, )
             val = cPickle.dumps(host)
             self.client.set(key, val)
 
         for (host_name, service_desc), service in all_data['services'].iteritems():
-            key = "SERVICE-%s,%s" % (host_name, service_desc)
+            key = 'SERVICE-%s,%s' % (host_name, service_desc)
             # space are not allowed in redis key.. so change it by SPACE token
             key = key.replace(' ', 'SPACE')
             val = cPickle.dumps(service)
             self.client.set(key, val)
         logger.info('Retention information updated in Redis')
+
+    def _yield_outdated_keys(self, daemon):
+        '''
+        Yield all redis keys for outdated hosts and services.
+
+        ATTENTION:
+            This is hacky in any multi-shared setup as different schedulers will have
+            different knowledge of hosts. Use this function wisely. Also it's really cpu
+            consuming as it's calling the redis KEYS * command to get all redis keys.
+
+        :param daemon: scheduler
+        :yields: outdated redis key
+        '''
+        # get all available hosts and services from the daemon
+        all_data = daemon.get_retention_data()
+
+        # get all redis keys and check which of these dont exist in the daemons' data
+        for key in self.client.keys('*'):
+            # check `HOST-` keys
+            if re.search(r'HOST-', key):
+                (host_name,) = re.match(r'HOST-(.*)', key).groups()
+                if host_name not in all_data['hosts']:
+                    yield key
+
+            # check `SERVICE-` keys
+            elif re.search(r'SERVICE-([^,]+),(.*)', key):
+                (host_name, service_desc) = re.match(r'SERVICE-([^,]+),(.*)', key).groups()
+                service_desc = service_desc.replace('SPACE', ' ') # add old spaces back
+                if (host_name, service_desc) not in all_data['services']:
+                    yield key
+
+            # ignore any invalid keys
+            else:
+                pass
 
     def hook_load_retention(self, daemon):
         '''
@@ -116,14 +151,14 @@ class RedisRetentionScheduler(BaseModule):
 
         # We must load the data and format as the scheduler want :)
         for host in daemon.hosts:
-            key = "HOST-%s" % host.host_name
+            key = 'HOST-%s' % (host.host_name, )
             val = self.client.get(key)
             if val is not None:
                 val = cPickle.loads(val)
                 ret_hosts[host.host_name] = val
 
         for service in daemon.services:
-            key = "SERVICE-%s,%s" % (service.host.host_name, service.service_description)
+            key = 'SERVICE-%s,%s' % (service.host.host_name, service.service_description)
             # space are not allowed in redis key.. so change it by SPACE token
             key = key.replace(' ', 'SPACE')
             val = self.client.get(key)
@@ -135,5 +170,10 @@ class RedisRetentionScheduler(BaseModule):
 
         # Ok, now comme load them scheduler :)
         daemon.restore_retention_data(all_data)
+
+        # Ok, daemon data is updated, let's clean up old redis data now
+        for key in self._yield_outdated_keys(daemon):
+            logger.debug('[RedisRetention] found outdated key %s' % (key, ))
+            self.client.delete(key)
 
         logger.info('[RedisRetention] Retention objects loaded successfully.')
