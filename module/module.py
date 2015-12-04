@@ -172,8 +172,11 @@ class RedisRetentionScheduler(BaseModule):
         daemon.restore_retention_data(all_data)
 
         # Ok, daemon data is updated, let's clean up old redis data now
+        delete_count = 0
         for key in self._yield_outdated_keys(daemon):
             logger.debug('[RedisRetention] found outdated key %s' % (key, ))
             self.client.delete(key)
+            delete_count += 1
+        logger.info('[RedisRetention] removed %d outdated keys' % (delete_count, ))
 
         logger.info('[RedisRetention] Retention objects loaded successfully.')
